@@ -1,0 +1,386 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          set -o pipefail
+          npm run lint 2>&1 | tee eslint-output.txt
+        continue-on-error: true
+
+      - name: Run Prettier formatting check
+        id: prettier
+        run: |
+          set -o pipefail
+          npx prettier --check . 2>&1 | tee prettier-output.txt
+        continue-on-error: true
+
+      - name: Post Code Quality Report to PR
+        uses: actions/github-script@v7
+        env:
+          ESLINT_OUTCOME: ${{ steps.eslint.outcome }}
+          PRETTIER_OUTCOME: ${{ steps.prettier.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const eslintOutput = fs.readFileSync('eslint-output.txt', 'utf8') || 'No ESLint output generated';
+            const prettierOutput = fs.readFileSync('prettier-output.txt', 'utf8') || 'No Prettier output generated';
+            
+            const eslintPassed = process.env.ESLINT_OUTCOME === 'success';
+            const prettierPassed = process.env.PRETTIER_OUTCOME === 'success';
+
+            const commentBody = `### Code Quality Report
+
+            **ESLint Status**: ${eslintPassed ? '✅ All checks passed' : '❌ Linting errors found'}
+            <details>
+            <summary>ESLint Results</summary>
+
+            \`\`\`
+            ${eslintOutput}
+            \`\`\`
+
+            </details>
+
+            **Prettier Status**: ${prettierPassed ? '✅ Formatting valid' : '❌ Formatting issues detected'}
+            <details>
+            <summary>Prettier Results</summary>
+
+            \`\`\`
+            ${prettierOutput}
+            \`\`\`
+
+            </details>
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+      - name: Validate code quality status
+        run: |
+          if [ "${{ steps.eslint.outcome }}" != "success" ] || [ "${{ steps.prettier.outcome }}" != "success" ]; then
+            echo "::error::Code quality checks failed. See PR comment for details."
+            exit 1
+          fi
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite with coverage
+        id: tests
+        run: |
+          set -o pipefail
+          npm test -- --coverage 2>&1 | tee test-output.txt
+        continue-on-error: true
+
+      - name: Extract coverage summary
+        id: coverage
+        run: |
+          # Extract coverage table for all files
+          if grep -q "All files" test-output.txt; then
+            grep -A 5 "All files" test-output.txt > coverage-summary.txt
+          else
+            echo "Coverage summary not available in test output" > coverage-summary.txt
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-report
+          path: coverage/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Post Test Coverage Report to PR
+        uses: actions/github-script@v7
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const testOutput = fs.readFileSync('test-output.txt', 'utf8') || 'No test output generated';
+            const coverageSummary = fs.readFileSync('coverage-summary.txt', 'utf8') || 'No coverage summary available';
+            
+            const testsPassed = process.env.TESTS_OUTCOME === 'success';
+
+            const commentBody = `### Test Coverage Report
+
+            **Test Suite Status**: ${testsPassed ? '✅ All tests passed' : '❌ Test failures detected'}
+            
+            **Coverage Summary**:
+            \`\`\`
+            ${coverageSummary}
+            \`\`\`
+
+            <details>
+            <summary>Full Test Output</summary>
+
+            \`\`\`
+            ${testOutput}
+            \`\`\`
+
+            </details>
+
+            Full coverage report is available as a workflow artifact.
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+      - name: Validate test suite status
+        run: |
+          if [ "${{ steps.tests.outcome }}" != "success" ]; then
+            echo "::error::Test suite failed. See PR comment for details."
+            exit 1
+          fi
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability scan (npm audit)
+        id: npm-audit
+        run: |
+          set -o pipefail
+          npm audit --json > npm-audit.json 2>&1 || npm audit 2>&1 | tee npm-audit.txt
+        continue-on-error: true
+
+      - name: Run secret scanning on PR changes
+        id: secret-scan
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+        continue-on-error: true
+
+      - name: Post Security Scan Report to PR
+        uses: actions/github-script@v7
+        env:
+          NPM_AUDIT_OUTCOME: ${{ steps.npm-audit.outcome }}
+          SECRET_SCAN_OUTCOME: ${{ steps.secret-scan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            let dependencyVulnText = '';
+            
+            try {
+              const auditData = JSON.parse(fs.readFileSync('npm-audit.json', 'utf8'));
+              const vulns = auditData.metadata?.vulnerabilities || {};
+              dependencyVulnText = `Total vulnerabilities in Dependencies: ${vulns.total || 0}
+  - Critical: ${vulns.critical || 0}
+  - High: ${vulns.high || 0}
+  - Moderate: ${vulns.moderate || 0}
+  - Low: ${vulns.low || 0}`;
+            } catch (err) {
+              dependencyVulnText = fs.readFileSync('npm-audit.txt', 'utf8') || 'No vulnerability data available';
+            }
+
+            const secretScanText = process.env.SECRET_SCAN_OUTCOME === 'success' 
+              ? 'No hardcoded secrets detected in code changes' 
+              : 'Potential secrets detected in code changes - review required';
+              
+            const vulnsFound = process.env.NPM_AUDIT_OUTCOME !== 'success';
+            const secretsFound = process.env.SECRET_SCAN_OUTCOME !== 'success';
+
+            const commentBody = `### Security Scan Report
+
+            **Dependency Vulnerability Scan**: ${vulnsFound ? '⚠️ Vulnerabilities detected' : '✅ No known vulnerabilities found'}
+            \`\`\`
+            ${dependencyVulnText}
+            \`\`\`
+
+            **Secret Scanning**: ${secretsFound ? '⚠️ Potential secrets found' : '✅ No secrets detected in changes'}
+            \`\`\`
+            ${secretScanText}
+            \`\`\`
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+      - name: Validate security status
+        run: |
+          # Fail if secrets are detected
+          if [ "${{ steps.secret-scan.outcome }}" != "success" ]; then
+            echo "::error::Potential secrets detected in code changes. See PR comment for details."
+            exit 1
+          fi
+
+          # Fail if critical dependency vulnerabilities exist
+          if [ -f npm-audit.json ]; then
+            CRITICAL_COUNT=$(node -e "const audit = require('./npm-audit.json'); console.log(audit.metadata?.vulnerabilities?.critical || 0)")
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "::error::$CRITICAL_COUNT critical dependency vulnerabilities found. See PR comment for details."
+              exit 1
+            fi
+          fi
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee build-output.txt
+        continue-on-error: true
+
+      - name: Validate application endpoints
+        id: endpoint-check
+        if: steps.build.outcome == 'success'
+        run: |
+          # Start application in background (adjust start command if needed for your project)
+          npm start &
+          SERVER_PID=$!
+          
+          # Wait for server to initialize
+          sleep 15
+
+          # Validate health endpoint (update endpoint to match your application)
+          echo "Checking /health endpoint..."
+          if curl -f -s http://localhost:3000/health > /dev/null; then
+            echo "✅ /health endpoint accessible"
+          else
+            echo "❌ /health endpoint not reachable"
+            kill $SERVER_PID
+            exit 1
+          fi
+
+          # Add additional endpoint checks here as needed for your application
+
+          # Shutdown background server
+          kill $SERVER_PID
+        continue-on-error: true
+
+      - name: Upload deployment preview artifacts
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: |
+            build/
+            dist/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Post Build Validation status to PR
+        uses: actions/github-script@v7
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          ENDPOINT_OUTCOME: ${{ steps.endpoint-check.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const buildOutput = fs.readFileSync('build-output.txt', 'utf8') || 'No build output generated';
+            
+            const buildSucceeded = process.env.BUILD_OUTCOME === 'success';
+            const endpointsValid = process.env.ENDPOINT_OUTCOME === 'success';
+
+            const commentBody = `### Build Validation
+
+            **Build Status**: ${buildSucceeded ? '✅ Build completed successfully' : '❌ Build failed'}
+            <details>
+            <summary>Build Output</summary>
+
+            \`\`\`
+            ${buildOutput}
+            \`\`\`
+
+            </details>
+
+            ${buildSucceeded ? `**Endpoint Validation**: ${endpointsValid ? '✅ All checked endpoints are accessible' : '❌ Endpoint validation failed'}` : ''}
+            
+            ${buildSucceeded ? 'Deployment preview artifacts are available for download as workflow artifacts.' : 'Fix build errors to generate deployment artifacts.'}
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+      - name: Validate build status
+        run: |
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            echo "::error::Application build failed. See PR comment for details."
+            exit 1
+          fi
+          if [ "${{ steps.endpoint-check.outcome }}" != "success" ]; then
+            echo "::error::Endpoint validation failed. See PR comment for details."
+            exit 1
+          fi
